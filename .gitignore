@@ -1,0 +1,9 @@
+﻿# local config edits - don't commit user-specific keys
+mr_benkhriza_gui.json
+
+*.log
+logs/
+*.zip
+
+Thumbs.db
+.DS_Store
