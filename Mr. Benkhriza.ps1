@@ -109,7 +109,7 @@ if (Test-Path $global:AppState.ConfigPath) {
         $global:AppState.GithubToken   = if ($loaded.GithubToken)   { $loaded.GithubToken }   else { "" }
         $global:AppState.LocalRepoPath = if ($loaded.LocalRepoPath) { $loaded.LocalRepoPath } else { "" }
         $global:AppState.AdminPassword    = if ($loaded.AdminPassword) { $loaded.AdminPassword } else { "BENKHRIZA-ADMIN-2026" }
-        $global:AppState.LicenseServerUrl = if ($loaded.LicenseServerUrl) { $loaded.LicenseServerUrl } else { "http://192.168.129.130:8080" }
+        $global:AppState.LicenseServerUrl = if ($loaded.LicenseServerUrl) { $loaded.LicenseServerUrl } else { "https://walker-implied-spears-church.trycloudflare.com" }
     } catch {
         $global:AppState.Theme         = $defaultConfig.Theme
         $global:AppState.BackupUrl     = $defaultConfig.BackupUrl
