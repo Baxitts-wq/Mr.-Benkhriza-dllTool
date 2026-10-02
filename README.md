@@ -1,6 +1,9 @@
 # Mr. Benkhriza â€” Steam DLL Tool
 **by Benkhriza**
 
+> Retro hacker-style launcher for managing your Steam Lua configs.  
+> Drag, drop, done. No command line BS.
+
 ---
 
 ## what is this

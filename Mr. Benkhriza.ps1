@@ -74,6 +74,7 @@ $global:AppState = [PSCustomObject]@{
     GithubToken      = $null
     LocalRepoPath    = $null
     AdminPassword    = $null
+    LicenseServerUrl = $null
     HWID             = $null
     Theme            = $null
     Controls         = @{}
@@ -88,6 +89,7 @@ $defaultConfig = @{
     GithubToken      = ""
     LocalRepoPath    = ""
     AdminPassword    = "Imad.993514"
+    LicenseServerUrl = "http://192.168.129.130:8080"
     Theme = @{
         AccentGreen  = "#00FF41"
         AccentRed    = "#FF003C"
@@ -106,13 +108,15 @@ if (Test-Path $global:AppState.ConfigPath) {
         $global:AppState.BackupUrl     = $loaded.BackupUrl
         $global:AppState.GithubToken   = if ($loaded.GithubToken)   { $loaded.GithubToken }   else { "" }
         $global:AppState.LocalRepoPath = if ($loaded.LocalRepoPath) { $loaded.LocalRepoPath } else { "" }
-        $global:AppState.AdminPassword = if ($loaded.AdminPassword) { $loaded.AdminPassword } else { "BENKHRIZA-ADMIN-2026" }
+        $global:AppState.AdminPassword    = if ($loaded.AdminPassword) { $loaded.AdminPassword } else { "BENKHRIZA-ADMIN-2026" }
+        $global:AppState.LicenseServerUrl = if ($loaded.LicenseServerUrl) { $loaded.LicenseServerUrl } else { "http://192.168.129.130:8080" }
     } catch {
         $global:AppState.Theme         = $defaultConfig.Theme
         $global:AppState.BackupUrl     = $defaultConfig.BackupUrl
         $global:AppState.GithubToken   = $defaultConfig.GithubToken
         $global:AppState.LocalRepoPath = $defaultConfig.LocalRepoPath
-        $global:AppState.AdminPassword = $defaultConfig.AdminPassword
+        $global:AppState.AdminPassword    = $defaultConfig.AdminPassword
+        $global:AppState.LicenseServerUrl = $defaultConfig.LicenseServerUrl
     }
 } else {
     $defaultConfig | ConvertTo-Json -Depth 4 | Out-File $global:AppState.ConfigPath -Encoding utf8
@@ -120,7 +124,8 @@ if (Test-Path $global:AppState.ConfigPath) {
     $global:AppState.BackupUrl     = $defaultConfig.BackupUrl
     $global:AppState.GithubToken   = $defaultConfig.GithubToken
     $global:AppState.LocalRepoPath = $defaultConfig.LocalRepoPath
-    $global:AppState.AdminPassword = $defaultConfig.AdminPassword
+    $global:AppState.AdminPassword    = $defaultConfig.AdminPassword
+    $global:AppState.LicenseServerUrl = $defaultConfig.LicenseServerUrl
 }
 
 # --- DPAPI license key storage (machine-bound, tamper-resistant) ---
@@ -232,74 +237,30 @@ function Get-PublicIP {
 function Test-SupabaseLicense {
     param([string]$LicenseKey)
 
-    # credentials decoded at runtime - not stored in config files
-    $sb = 'https://naxiwopzedyzsxthijep.supabase.co'
-    $sk = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im5heGl3b3B6ZWR5enN4dGhpamVwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODYwNjk0OTUsImV4cCI6MjEwMTY0NTQ5NX0.10Zfvzz0iGYVWd5TldbdO_jzerG-cQzmxhbwEO9KEWA'
-
     if ([string]::IsNullOrWhiteSpace($LicenseKey)) {
         return [PSCustomObject]@{ Success = $false; Mode = "MissingKey"; Message = "No license key provided."; HWID = (Get-SystemHWID) }
     }
 
-    $base    = $sb.TrimEnd('/')
-    $apiUrl  = "$base/rest/v1/licenses?license_key=eq.$([Uri]::EscapeDataString($LicenseKey))"
-    $headers = @{
-        "apikey"        = $sk
-        "Authorization" = "Bearer $sk"
-        "Accept"        = "application/json"
-    }
+    $serverUrl = if ($global:AppState -and $global:AppState.LicenseServerUrl) { $global:AppState.LicenseServerUrl } else { "http://192.168.129.130:8080" }
+    $apiUrl = "$($serverUrl.TrimEnd('/'))/api/license/verify"
+    $myHWID = Get-SystemHWID
+
+    $body = @{
+        license_key = $LicenseKey
+        hwid        = $myHWID
+    } | ConvertTo-Json
 
     try {
-        $response = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get -TimeoutSec 10
-        if (-not $response -or $response.Count -eq 0) {
-            return [PSCustomObject]@{ Success = $false; Mode = "InvalidKey"; Message = "Invalid license key - not found."; HWID = (Get-SystemHWID) }
+        $response = Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 10
+        return [PSCustomObject]@{
+            Success   = [bool]$response.success
+            Mode      = $response.mode
+            Message   = $response.message
+            HWID      = $myHWID
+            BoundHWID = $response.bound_hwid
         }
-
-        $lic = $response[0]
-        if ($lic.status -ne 'active') {
-            return [PSCustomObject]@{ Success = $false; Mode = "SuspendedKey"; Message = "License key has been suspended or revoked."; HWID = (Get-SystemHWID) }
-        }
-
-        $myHWID = Get-SystemHWID
-        $ipAddr = Get-PublicIP
-        $nowUtc = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-        $patchHeaders = @{
-            "apikey"        = $sk
-            "Authorization" = "Bearer $sk"
-            "Content-Type"  = "application/json"
-            "Prefer"        = "return=minimal"
-        }
-        $patchUrl = "$base/rest/v1/licenses?license_key=eq.$([Uri]::EscapeDataString($LicenseKey))"
-
-        # first launch - bind HWID
-        if ([string]::IsNullOrWhiteSpace($lic.hardware_id)) {
-            try {
-                $body = @{ hardware_id = $myHWID; ip_address = $ipAddr; activated_at = $nowUtc; updated_at = $nowUtc } | ConvertTo-Json
-                $null = Invoke-RestMethod -Uri $patchUrl -Headers $patchHeaders -Method Patch -Body $body -TimeoutSec 10
-            } catch {}
-            return [PSCustomObject]@{ Success = $true; Mode = "Activated"; Message = "License activated and hardware bound."; HWID = $myHWID }
-        }
-
-        # HWID check
-        if ($lic.hardware_id -ne $myHWID) {
-            return [PSCustomObject]@{
-                Success   = $false
-                Mode      = "HWIDMismatch"
-                Message   = "SECURITY VIOLATION: This key is registered to a different machine."
-                HWID      = $myHWID
-                BoundHWID = $lic.hardware_id
-            }
-        }
-
-        # update IP and last-seen in background
-        try {
-            $body = @{ ip_address = $ipAddr; updated_at = $nowUtc } | ConvertTo-Json
-            $null = Invoke-RestMethod -Uri $patchUrl -Headers $patchHeaders -Method Patch -Body $body -TimeoutSec 5
-        } catch {}
-
-        return [PSCustomObject]@{ Success = $true; Mode = "Verified"; Message = "License verified."; HWID = $myHWID }
     } catch {
-        return [PSCustomObject]@{ Success = $false; Mode = "ServerError"; Message = "Auth server error: $($_.Exception.Message)"; HWID = (Get-SystemHWID) }
+        return [PSCustomObject]@{ Success = $false; Mode = "ServerError"; Message = "Auth server error: $($_.Exception.Message)"; HWID = $myHWID }
     }
 }
 
@@ -1085,6 +1046,19 @@ function Import-FilesToDatabase {
             Copy-Item $f $dest -Force
             Add-Log "[+] Imported to catalog: $name" "#00FF00"
             $imported += $dest
+
+            # Upload to central community database in background
+            try {
+                $serverUrl = if ($global:AppState -and $global:AppState.LicenseServerUrl) { $global:AppState.LicenseServerUrl } else { "http://192.168.129.130:8080" }
+                $uploadUrl = "$($serverUrl.TrimEnd('/'))/api/lua/upload"
+                $luaContent = Get-Content -LiteralPath $f -Raw -Encoding utf8
+                $body = @{
+                    filename = $name
+                    content  = $luaContent
+                } | ConvertTo-Json
+                $null = Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
+                Add-Log "[CLOUD] Shared $name with central community database." "#00FF00"
+            } catch {}
         } catch { Add-Log "[!] [ERR] Import failed: $name" "#FF3333" }
     }
     if ($imported.Count -gt 0) {
@@ -1097,10 +1071,35 @@ function Import-FilesToDatabase {
 }
 
 # ------------------------------------------------------------------------------
-#  7. GitHub Backup Sync Engine
+#  7. Community Central Sync & GitHub Backup Engine
 # ------------------------------------------------------------------------------
 function Sync-Database {
-    Add-Log "[+] Synchronizing catalog..." "#00FF00"
+    Add-Log "[+] Synchronizing catalog with central database..." "#00FF00"
+    try {
+        $serverUrl = if ($global:AppState -and $global:AppState.LicenseServerUrl) { $global:AppState.LicenseServerUrl } else { "http://192.168.129.130:8080" }
+        $syncUrl = "$($serverUrl.TrimEnd('/'))/api/lua/sync"
+        $remoteLuas = Invoke-RestMethod -Uri $syncUrl -Method Get -TimeoutSec 10 -ErrorAction Stop
+        $newCount = 0
+        foreach ($item in $remoteLuas) {
+            if ($item.filename -and $item.content) {
+                $destFile = Join-Path $global:AppState.DbPath $item.filename
+                if (-not (Test-Path $destFile)) {
+                    Set-Content -Path $destFile -Value $item.content -Encoding utf8
+                    $newCount++
+                }
+            }
+        }
+        if ($newCount -gt 0) {
+            Add-Log "[CLOUD] Downloaded $newCount new community LUA script(s)!" "#00FF00"
+            Load-GameDatabase; Refresh-GameList
+            return
+        } else {
+            Add-Log "[CLOUD] All community LUA scripts are up to date." "#00FF00"
+        }
+    } catch {
+        Add-Log "[!] Central server sync unavailable: $($_.Exception.Message). Trying fallbacks..." "#FF9900"
+    }
+
     $source = Resolve-DatabaseSource -BackupUrl $global:AppState.BackupUrl -LocalRepoPath $global:AppState.LocalRepoPath
     if ($source.Mode -eq "local") {
         Add-Log "[*] Bundled local database detected at $($source.Path)." "#00FF00"
@@ -1128,41 +1127,7 @@ function Sync-Database {
         }
     }
 
-    $url = $global:AppState.BackupUrl
-    if ([string]::IsNullOrEmpty($url)) {
-        Add-Log "[!] No BackupUrl configured. Using local database only." "#FF9900"
-        Load-GameDatabase; Refresh-GameList
-        return
-    }
-
-    $apiUrl = $url
-    $rawPattern = 'raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)'
-    if ($url -match $rawPattern) {
-        $owner  = $Matches[1]; $repo   = $Matches[2]
-        $branch = $Matches[3]; $path   = $Matches[4].TrimEnd('/')
-        $apiUrl = "https://api.github.com/repos/$owner/$repo/contents/$path"
-    }
-    try {
-        $headers = @{ "User-Agent" = "Benkhriza-Bypass-Loader/2.1" }
-        if ($global:AppState.GithubToken) { $headers.Add("Authorization", "token $($global:AppState.GithubToken)") }
-        Add-Log "[*] Querying: $apiUrl" "#00FF00"
-        $items = Invoke-RestMethod -Uri $apiUrl -Headers $headers -Method Get -TimeoutSec 15
-        $count = 0
-        foreach ($item in $items) {
-            if ($item.name -like "*.lua" -and $item.download_url) {
-                $dest = Join-Path $global:AppState.DbPath $item.name
-                Invoke-RestMethod -Uri $item.download_url -OutFile $dest -Headers $headers -TimeoutSec 15
-                Add-Log "[+] Synced: $($item.name)" "#00FF00"
-                $count++
-            }
-        }
-        Add-Log "[*] Sync complete - $count file(s) downloaded." "#00FF00"
-        Load-GameDatabase; Refresh-GameList
-    } catch {
-        Add-Log "[!] [ERR] Sync failed: $($_.Exception.Message)" "#FF3333"
-        Add-Log "[!] Using the bundled local database." "#FF9900"
-        Load-GameDatabase; Refresh-GameList
-    }
+    Load-GameDatabase; Refresh-GameList
 }
 
 # ------------------------------------------------------------------------------
