@@ -61,7 +61,7 @@ $global:CrashLogPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Mr_B
 #  2. State & Configuration
 # ------------------------------------------------------------------------------
 $global:AppState = [PSCustomObject]@{
-    Version          = "2.1.0"
+    Version          = "2.2.0"
     ConfigPath       = Join-Path $PSScriptRoot "mr_benkhriza_gui.json"
     XamlPath         = Join-Path $PSScriptRoot "Mr. Benkhriza.xaml"
     DbPath           = Join-Path $PSScriptRoot "database"
@@ -195,6 +195,67 @@ $global:AppState.SteamLuaPath = Join-Path $global:AppState.SteamRoot "config\lua
 if (-not (Test-Path $global:AppState.SteamLuaPath)) {
     try { New-Item -ItemType Directory -Path $global:AppState.SteamLuaPath -Force | Out-Null } catch {}
 }
+
+# --- Auto-Setup: Automatically ensure SteamFiles & configs are present in Steam ---
+function Initialize-SteamEnvironment {
+    param([string]$SteamPath = $global:AppState.SteamRoot)
+    if ([string]::IsNullOrWhiteSpace($SteamPath)) { return }
+    if (-not (Test-Path $SteamPath)) {
+        try { New-Item -ItemType Directory -Path $SteamPath -Force | Out-Null } catch {}
+    }
+    $luaDir = Join-Path $SteamPath "config\lua"
+    if (-not (Test-Path $luaDir)) {
+        try { New-Item -ItemType Directory -Path $luaDir -Force | Out-Null } catch {}
+    }
+
+    $sfDir = Join-Path $PSScriptRoot "SteamFiles"
+    if (Test-Path $sfDir) {
+        $requiredFiles = @("OpenSteamTool.dll", "dwmapi.dll", "xinput1_4.dll", "opensteamtool.toml")
+        $deployed = 0
+        foreach ($rf in $requiredFiles) {
+            $srcFile = Join-Path $sfDir $rf
+            $dstFile = Join-Path $SteamPath $rf
+            if ((Test-Path $srcFile) -and (-not (Test-Path $dstFile))) {
+                try {
+                    Copy-Item -Path $srcFile -Destination $dstFile -Force -ErrorAction SilentlyContinue
+                    $deployed++
+                } catch {}
+            }
+        }
+        if ($deployed -gt 0) {
+            Add-Log "[*] [AUTO-SETUP] $deployed composant(s) Steam deployes automatiquement dans $SteamPath" "#00FF00"
+        }
+    }
+
+    $manifestDst = Join-Path $luaDir "manifest.lua"
+    if (-not (Test-Path $manifestDst)) {
+        $manifestSrc = Join-Path $sfDir "config\lua\manifest.lua"
+        if (Test-Path $manifestSrc) {
+            try { Copy-Item -Path $manifestSrc -Destination $manifestDst -Force -ErrorAction SilentlyContinue } catch {}
+        } else {
+            @'
+-- manifest.lua -- Auto-generated
+function fetch_manifest_code(gid)
+    local body, st = http_get("https://manifest.steam.run/api/manifest/" .. gid)
+    if st == 200 and body then
+        local code = body:match('"content":"(%d+)"')
+        if code then return code end
+    end
+    return nil
+end
+'@ | Out-File -FilePath $manifestDst -Encoding UTF8 -Force
+        }
+    }
+
+    $mygamesDst = Join-Path $luaDir "mygames.lua"
+    if (-not (Test-Path $mygamesDst)) {
+        try {
+            "-- mygames.lua -- Auto-managed by Mr. Benkhriza" | Out-File -FilePath $mygamesDst -Encoding UTF8 -Force
+        } catch {}
+    }
+}
+
+try { Initialize-SteamEnvironment } catch {}
 
 if (-not $global:AppState.LogFilePath) {
     $global:AppState.LogFilePath = Join-Path $global:AppState.SteamRoot "opensteamtool\mr_benkhriza.log"
@@ -977,6 +1038,102 @@ function Resolve-DatabaseSource {
     }
 }
 
+# ------------------------------------------------------------------------------
+#  OTA (Over-The-Air) Dynamic Update System
+# ------------------------------------------------------------------------------
+function Check-OtaUpdate {
+    [CmdletBinding()]
+    param(
+        [switch]$Silent
+    )
+    $otaCandidates = @(
+        "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-dllTool/main/version.json",
+        "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-Lua-dllTool/main/version.json"
+    )
+    if ($global:AppState -and $global:AppState.LicenseServerUrl) {
+        $otaCandidates = @("$($global:AppState.LicenseServerUrl.TrimEnd('/'))/api/version.json") + $otaCandidates
+    }
+
+    $manifest = $null
+    foreach ($cand in $otaCandidates) {
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($cand)
+            $req.Timeout = 3000
+            $req.UserAgent = "MrBenkhriza-OTA/$($global:AppState.Version)"
+            $resp = $req.GetResponse()
+            $stream = $resp.GetResponseStream()
+            $reader = New-Object System.IO.StreamReader($stream)
+            $json = $reader.ReadToEnd()
+            $reader.Close()
+            $resp.Close()
+
+            if (-not [string]::IsNullOrWhiteSpace($json)) {
+                $manifest = $json | ConvertFrom-Json
+                if ($manifest -and $manifest.version) { break }
+            }
+        } catch {}
+    }
+
+    if (-not $manifest -or -not $manifest.version) {
+        if (-not $Silent) {
+            Add-Log "[OTA] Aucun serveur de mise a jour joignable pour le moment." "#888888"
+        }
+        return $false
+    }
+
+    try {
+        $remoteVer  = [version]$manifest.version
+        $currentVer = [version]$global:AppState.Version
+
+        if ($remoteVer -gt $currentVer) {
+            Add-Log "=================================================" "#00FFFF"
+            Add-Log "[OTA] NOUVELLE MISE A JOUR DETECTEE: v$remoteVer (Version actuelle: v$currentVer)" "#00FFFF"
+            if ($manifest.changelog) {
+                Add-Log "[OTA] Notes de mise a jour: $($manifest.changelog)" "#00FF41"
+            }
+            Add-Log "[OTA] Telechargement et installation automatique des correctifs..." "#FF9900"
+
+            $allOk = $true
+            if ($manifest.files) {
+                foreach ($item in $manifest.files) {
+                    if ($item.name -and $item.url) {
+                        $target = Join-Path $PSScriptRoot $item.name
+                        $tmp = "$target.ota.tmp"
+                        try {
+                            $wc = New-Object System.Net.WebClient
+                            $wc.Headers.Add("User-Agent", "MrBenkhriza-OTA")
+                            $wc.DownloadFile($item.url, $tmp)
+                            if ((Test-Path $tmp) -and (Get-Item $tmp).Length -gt 50) {
+                                Move-Item -Path $tmp -Destination $target -Force
+                                Add-Log "[OTA] [OK] Patch applique: $($item.name)" "#00FF00"
+                            } else {
+                                $allOk = $false
+                            }
+                        } catch {
+                            Add-Log "[OTA] [!] Erreur pour $($item.name): $($_.Exception.Message)" "#FF3333"
+                            $allOk = $false
+                        }
+                    }
+                }
+            }
+
+            if ($allOk) {
+                Add-Log "[OTA] [SUCCES] Mise a jour v$remoteVer installee avec succes !" "#00FF41"
+                Add-Log "[OTA] Redemarrez l'application pour activer toutes les modifications." "#00FFFF"
+            }
+            Add-Log "=================================================" "#00FFFF"
+            return $true
+        } else {
+            if (-not $Silent) {
+                Add-Log "[OTA] Votre application est a jour (v$currentVer)." "#00FF41"
+            }
+            return $false
+        }
+    } catch {
+        return $false
+    }
+}
+
 function Set-SteamLaunchOptions {
     param(
         [Parameter(Mandatory=$true)][string]$AppId,
@@ -987,20 +1144,50 @@ function Set-SteamLaunchOptions {
         return $false
     }
     $regPath = "HKCU:\Software\Valve\Steam\Apps\$AppId"
+    $success = $false
     try {
         if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
         if ($Enable) {
             Set-ItemProperty -Path $regPath -Name "LaunchOptions" -Value "-onlinefix" -Type String -ErrorAction Stop
-            Add-Log "[*] Steam launch options set for AppID $AppId -> -onlinefix" "#00FF00"
+            Add-Log "[*] Steam Registry: LaunchOptions activees pour AppID $AppId (-onlinefix)" "#00FF00"
         } else {
             Remove-ItemProperty -Path $regPath -Name "LaunchOptions" -ErrorAction SilentlyContinue
-            Add-Log "[*] Steam launch options removed for AppID $AppId" "#00FF00"
+            Add-Log "[*] Steam Registry: LaunchOptions retirees pour AppID $AppId" "#00FF00"
         }
-        return $true
+        $success = $true
     } catch {
-        Add-Log "[!] Could not update Steam launch options: $($_.Exception.Message)" "#FF3333"
-        return $false
+        Add-Log "[!] Could not update Steam registry launch options: $($_.Exception.Message)" "#FF3333"
     }
+
+    # Mise a jour dans les profils Steam (userdata/*/config/localconfig.vdf)
+    if ($global:AppState -and $global:AppState.SteamRoot) {
+        $userDir = Join-Path $global:AppState.SteamRoot "userdata"
+        if (Test-Path $userDir) {
+            try {
+                $subDirs = Get-ChildItem -Path $userDir -Directory -ErrorAction SilentlyContinue
+                foreach ($ud in $subDirs) {
+                    $vdf = Join-Path $ud.FullName "config\localconfig.vdf"
+                    if (Test-Path $vdf) {
+                        $txt = [System.IO.File]::ReadAllText($vdf, [System.Text.Encoding]::UTF8)
+                        if ($Enable) {
+                            if ($txt -match '(?s)("' + $AppId + '"\s*\{[^}]*?"LaunchOptions"\s*")[^"]*(")') {
+                                $txt = $txt -replace '(?s)("' + $AppId + '"\s*\{[^}]*?"LaunchOptions"\s*")[^"]*(")', '$1-onlinefix$2'
+                                [System.IO.File]::WriteAllText($vdf, $txt, [System.Text.Encoding]::UTF8)
+                                Add-Log "[*] Steam VDF: localconfig.vdf mis a jour pour $($ud.Name)" "#00FF00"
+                            }
+                        } else {
+                            if ($txt -match '(?s)("' + $AppId + '"\s*\{[^}]*?"LaunchOptions"\s*")[^"]*(")') {
+                                $txt = $txt -replace '(?s)("' + $AppId + '"\s*\{[^}]*?"LaunchOptions"\s*")[^"]*(")', '$1$2'
+                                [System.IO.File]::WriteAllText($vdf, $txt, [System.Text.Encoding]::UTF8)
+                            }
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
+
+    return $success
 }
 
 # ------------------------------------------------------------------------------
@@ -1642,29 +1829,62 @@ if ($global:AppState.Controls.InjectBtn) {
 if ($global:AppState.Controls.InjectOnlineFixBtn) {
     $global:AppState.Controls.InjectOnlineFixBtn.Add_Click({
         $sel = $global:AppState.Controls.GameList.SelectedItem
-        if (-not $sel) { Add-Log "[!] Select a game from the list first." "#FF9900"; return }
+        if (-not $sel) { Add-Log "[!] Veuillez selectionner un jeu dans la liste d'abord." "#FF9900"; return }
         $g = $global:GamesCache | Where-Object { $_.Display -eq $sel } | Select-Object -First 1
         if ($g) {
+            Add-Log "=================================================" "#00FFFF"
+            Add-Log "[*] [ONLINEFIX v2] Configuration Multijoueur pour $($g.Title) (AppID $($g.AppId))..." "#00FF41"
+
+            # 1. Injecter le script Lua dans Steam
+            Add-Log "[*] [ONLINEFIX] Etape 1/3: Injection du manifeste Lua dans Steam..." "#00FF00"
+            Install-LuaFiles @($g.FilePath)
+
+            # 2. Configurer les options de lancement -onlinefix
+            Add-Log "[*] [ONLINEFIX] Etape 2/3: Application de l'argument Steam (-onlinefix)..." "#00FF00"
+            $null = Set-SteamLaunchOptions -AppId $g.AppId -Enable:$true
+            if ($global:AppState.Controls.OnlineFixChk) {
+                $global:AppState.Controls.OnlineFixChk.IsChecked = $true
+            }
+
+            # 3. Detection et lancement
             $steamProcess = Get-Process steam -ErrorAction SilentlyContinue
             if ($steamProcess) {
-                Add-Log "[!] WARNING: Steam is currently running!" "#FF3333"
-                Add-Log "[!] For best results: close Steam, apply Online Fix, then reopen Steam." "#FF9900"
-            }
-            $onlineFixEnabled = ($global:AppState.Controls.OnlineFixChk -and
-                                  $global:AppState.Controls.OnlineFixChk.IsChecked -eq $true)
-            $launchOptionsSet = Set-SteamLaunchOptions -AppId $g.AppId -Enable:$onlineFixEnabled
-            if ($onlineFixEnabled) {
-                Add-Log "[*] Online Fix applied. Launching game with -onlinefix..." "#00FF00"
+                Add-Log "[*] [ONLINEFIX] Etape 3/3: Steam en execution detecte." "#00FF00"
+                Add-Log "[*] Lancement direct avec -onlinefix via Steam..." "#00FF41"
                 try {
-                    if (-not $launchOptionsSet) {
-                        Add-Log "[!] Steam launch options could not be updated, but the Steam URL will still be attempted." "#FF9900"
-                    }
                     Start-Process "steam://run/$($g.AppId)//-onlinefix"
-                } catch { Add-Log "[!] Could not launch Steam URL." "#FF3333" }
+                    Add-Log "[+] Commande envoyee a Steam avec succes !" "#00FF00"
+                } catch {
+                    Add-Log "[!] Impossible d'invoquer l'URL Steam: $($_.Exception.Message)" "#FF3333"
+                }
+                Add-Log "[i] CONSEIL MULTIJOUEUR: Si le jeu ne detecte pas les serveurs/amis, fermez completement Steam puis relancez-le." "#00FFFF"
             } else {
-                Add-Log "[*] Online Fix removed for AppID $($g.AppId)." "#FF9900"
+                Add-Log "[*] [ONLINEFIX] Etape 3/3: Steam est ferme. LaunchOptions pre-configurees." "#00FF00"
+                Add-Log "[+] Demarrez Steam pour jouer en ligne !" "#00FF41"
             }
-        } else { Add-Log "[!] Game metadata not found." "#FF3333" }
+
+            Add-Log "[i] Compatibilite Spacewar: Pour les jeux OnlineFix utilisant AppID 480, verifiez que Spacewar est installe (steam://install/480)." "#00FFFF"
+            Add-Log "=================================================" "#00FFFF"
+        } else {
+            Add-Log "[!] Metadonnees du jeu introuvables." "#FF3333"
+        }
+    })
+}
+
+if ($global:AppState.Controls.OnlineFixChk) {
+    $global:AppState.Controls.OnlineFixChk.Add_Click({
+        $sel = $global:AppState.Controls.GameList.SelectedItem
+        if (-not $sel) { return }
+        $g = $global:GamesCache | Where-Object { $_.Display -eq $sel } | Select-Object -First 1
+        if ($g) {
+            $isChecked = ($global:AppState.Controls.OnlineFixChk.IsChecked -eq $true)
+            Set-SteamLaunchOptions -AppId $g.AppId -Enable:$isChecked | Out-Null
+            if ($isChecked) {
+                Add-Log "[*] Drapeau OnlineFix active pour $($g.Title)." "#00FF00"
+            } else {
+                Add-Log "[*] Drapeau OnlineFix desactive pour $($g.Title)." "#FF9900"
+            }
+        }
     })
 }
 
@@ -1861,6 +2081,7 @@ if ($global:AppState.Window) {
                                         Add-TypewriterLog "[BOOT] Memory hooks established. System ready." "#00FF00" 5 {
                                             Add-Log "[BOOT] Catalog loaded - $($global:GamesCache.Count) game(s) in database." "#00FF00"
                                             Add-Log "[BOOT] System ready." "#00FF00"
+                                            try { Check-OtaUpdate -Silent } catch {}
                                         }
                                     }
                                 }
