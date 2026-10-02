@@ -234,6 +234,50 @@ function Get-PublicIP {
     }
 }
 
+function Get-LicenseServerCandidates {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+
+    # 1. Configured URL if already a public HTTPS URL (not local LAN)
+    $cfgUrl = if ($global:AppState -and $global:AppState.LicenseServerUrl) { $global:AppState.LicenseServerUrl.Trim().TrimEnd('/') } else { "" }
+    if ($cfgUrl -and $cfgUrl -match '^https://') {
+        $candidates.Add($cfgUrl)
+    }
+
+    # 2. Realtime dynamic discovery from Ntfy (updated live by PC2 tunnel daemon, sub-300ms)
+    try {
+        $resp = Invoke-RestMethod -Uri 'https://ntfy.sh/bexytv-internal-url-998877/json?poll=1' -TimeoutSec 3
+        if ($resp -is [array]) {
+            for ($i = $resp.Count - 1; $i -ge 0; $i--) {
+                if ($resp[$i].message -match 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com') {
+                    $candidates.Add($matches[0])
+                    break
+                }
+            }
+        } elseif ($resp.message -match 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com') {
+            $candidates.Add($matches[0])
+        }
+    } catch {}
+
+    # 3. Permanent GitHub Raw resolver from repository
+    try {
+        $ghRaw = (Invoke-RestMethod -Uri 'https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-dllTool/main/server_url.txt' -TimeoutSec 3).Trim()
+        if ($ghRaw -match '^https?://[a-zA-Z0-9\.\-]+') {
+            $candidates.Add($ghRaw.TrimEnd('/'))
+        }
+    } catch {}
+
+    # 4. Known active Cloudflare tunnel
+    $candidates.Add("https://walker-implied-spears-church.trycloudflare.com")
+
+    # 5. Local LAN IP as final fallback (for local Wi-Fi dev)
+    if ($cfgUrl -and $cfgUrl -notmatch '^https://') {
+        $candidates.Add($cfgUrl)
+    }
+    $candidates.Add("http://192.168.129.130:8080")
+
+    return @($candidates | Select-Object -Unique)
+}
+
 function Test-SupabaseLicense {
     param([string]$LicenseKey)
 
@@ -241,26 +285,43 @@ function Test-SupabaseLicense {
         return [PSCustomObject]@{ Success = $false; Mode = "MissingKey"; Message = "No license key provided."; HWID = (Get-SystemHWID) }
     }
 
-    $serverUrl = if ($global:AppState -and $global:AppState.LicenseServerUrl) { $global:AppState.LicenseServerUrl } else { "http://192.168.129.130:8080" }
-    $apiUrl = "$($serverUrl.TrimEnd('/'))/api/license/verify"
     $myHWID = Get-SystemHWID
-
     $body = @{
         license_key = $LicenseKey
         hwid        = $myHWID
     } | ConvertTo-Json
 
-    try {
-        $response = Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 10
-        return [PSCustomObject]@{
-            Success   = [bool]$response.success
-            Mode      = $response.mode
-            Message   = $response.message
-            HWID      = $myHWID
-            BoundHWID = $response.bound_hwid
+    $candidates = Get-LicenseServerCandidates
+    $lastError = "No connection possible to authentication server."
+
+    foreach ($serverUrl in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($serverUrl)) { continue }
+        $apiUrl = "$($serverUrl.TrimEnd('/'))/api/license/verify"
+        try {
+            $response = Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 4
+            if ($response) {
+                # Success reaching server - cache this working server URL in AppState
+                if ($global:AppState) { $global:AppState.LicenseServerUrl = $serverUrl }
+
+                return [PSCustomObject]@{
+                    Success   = [bool]$response.success
+                    Mode      = $response.mode
+                    Message   = $response.message
+                    HWID      = $myHWID
+                    BoundHWID = $response.bound_hwid
+                }
+            }
+        } catch {
+            $lastError = $_.Exception.Message
+            continue
         }
-    } catch {
-        return [PSCustomObject]@{ Success = $false; Mode = "ServerError"; Message = "Auth server error: $($_.Exception.Message)"; HWID = $myHWID }
+    }
+
+    return [PSCustomObject]@{
+        Success = $false
+        Mode    = "ServerError"
+        Message = "Auth server error: $lastError"
+        HWID    = $myHWID
     }
 }
 
