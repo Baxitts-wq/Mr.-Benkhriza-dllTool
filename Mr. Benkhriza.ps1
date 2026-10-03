@@ -61,7 +61,7 @@ $global:CrashLogPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Mr_B
 #  2. State & Configuration
 # ------------------------------------------------------------------------------
 $global:AppState = [PSCustomObject]@{
-    Version          = "2.2.0"
+    Version          = "2.3.0"
     ConfigPath       = Join-Path $PSScriptRoot "mr_benkhriza_gui.json"
     XamlPath         = Join-Path $PSScriptRoot "Mr. Benkhriza.xaml"
     DbPath           = Join-Path $PSScriptRoot "database"
@@ -1321,6 +1321,67 @@ function Import-FilesToDatabase {
 # ------------------------------------------------------------------------------
 #  7. Community Central Sync & GitHub Backup Engine
 # ------------------------------------------------------------------------------
+function Update-SelectedLua {
+    $sel = $global:AppState.Controls.GameList.SelectedItem
+    if (-not $sel) { Add-Log "[!] Selectionnez d'abord un jeu dans la liste locale a mettre a jour." "#FF9900"; return }
+    $g = $global:GamesCache | Where-Object { $_.Display -eq $sel } | Select-Object -First 1
+    if (-not $g) { Add-Log "[!] Metadonnees introuvables pour le jeu selectionne." "#FF3333"; return }
+
+    Add-Log "=================================================" "#00FFFF"
+    Add-Log "[*] Recherche de mise a jour pour: $($g.Title) (AppID $($g.AppId))..." "#00FF41"
+
+    $serverUrl = if ($global:AppState -and $global:AppState.LicenseServerUrl) { $global:AppState.LicenseServerUrl } else { "http://192.168.129.130:8080" }
+    $updated = $false
+
+    # 1. Verification sur le serveur central Cloud / mini-supabase
+    try {
+        $syncUrl = "$($serverUrl.TrimEnd('/'))/api/lua/sync"
+        $remoteLuas = Invoke-RestMethod -Uri $syncUrl -Method Get -TimeoutSec 5 -ErrorAction Stop
+        $match = $remoteLuas | Where-Object { $_.app_id -eq "$($g.AppId)" -or $_.filename -like "$($g.AppId)*.lua" } | Select-Object -First 1
+        if ($match -and $match.content) {
+            $destFile = if ($g.FilePath) { $g.FilePath } else { Join-Path $global:AppState.DbPath "$($g.AppId).lua" }
+            $existingContent = if (Test-Path $destFile) { [System.IO.File]::ReadAllText($destFile, [System.Text.Encoding]::UTF8) } else { "" }
+            if ($existingContent.Trim() -ne $match.content.Trim()) {
+                [System.IO.File]::WriteAllText($destFile, $match.content, [System.Text.Encoding]::UTF8)
+                Add-Log "[CLOUD] [SUCCES] LUA mis a jour depuis la base centrale Cloud !" "#00FF00"
+                $updated = $true
+            } else {
+                Add-Log "[CLOUD] [OK] Le script local est deja parfaitement synchronise avec la base centrale." "#00FF00"
+                $updated = $true
+            }
+        }
+    } catch {
+        Add-Log "[!] Serveur central injoignable ($($_.Exception.Message)). Recherche sur le depot GitHub backup..." "#FF9900"
+    }
+
+    # 2. Si pas trouve ou indisponible, verification sur GitHub backup
+    if (-not $updated) {
+        try {
+            $url = $global:AppState.BackupUrl
+            $directUrl = "$($url.TrimEnd('/'))/$($g.AppId).lua"
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", "MrBenkhriza-LuaUpdater/2.3")
+            $remoteContent = $wc.DownloadString($directUrl)
+            if (-not [string]::IsNullOrWhiteSpace($remoteContent) -and $remoteContent -match "addappid") {
+                $destFile = if ($g.FilePath) { $g.FilePath } else { Join-Path $global:AppState.DbPath "$($g.AppId).lua" }
+                [System.IO.File]::WriteAllText($destFile, $remoteContent, [System.Text.Encoding]::UTF8)
+                Add-Log "[GITHUB] [SUCCES] LUA mis a jour depuis le depot GitHub !" "#00FF00"
+                $updated = $true
+            }
+        } catch {}
+    }
+
+    if ($updated) {
+        Load-GameDatabase
+        Refresh-GameList
+        $newMeta = $global:GamesCache | Where-Object { $_.AppId -eq "$($g.AppId)" } | Select-Object -First 1
+        if ($newMeta) { $global:AppState.Controls.GameList.SelectedItem = $newMeta.Display }
+    } else {
+        Add-Log "[!] Aucune version plus recente trouvee en ligne pour AppID $($g.AppId)." "#FF9900"
+    }
+    Add-Log "=================================================" "#00FFFF"
+}
+
 function Sync-Database {
     Add-Log "[+] Synchronizing catalog with central database..." "#00FF00"
     try {
@@ -1328,21 +1389,32 @@ function Sync-Database {
         $syncUrl = "$($serverUrl.TrimEnd('/'))/api/lua/sync"
         $remoteLuas = Invoke-RestMethod -Uri $syncUrl -Method Get -TimeoutSec 10 -ErrorAction Stop
         $newCount = 0
+        $updatedCount = 0
         foreach ($item in $remoteLuas) {
             if ($item.filename -and $item.content) {
                 $destFile = Join-Path $global:AppState.DbPath $item.filename
+                $shouldWrite = $false
                 if (-not (Test-Path $destFile)) {
-                    Set-Content -Path $destFile -Value $item.content -Encoding utf8
+                    $shouldWrite = $true
                     $newCount++
+                } else {
+                    $existingContent = [System.IO.File]::ReadAllText($destFile, [System.Text.Encoding]::UTF8)
+                    if ($existingContent.Trim() -ne $item.content.Trim()) {
+                        $shouldWrite = $true
+                        $updatedCount++
+                    }
+                }
+                if ($shouldWrite) {
+                    [System.IO.File]::WriteAllText($destFile, $item.content, [System.Text.Encoding]::UTF8)
                 }
             }
         }
-        if ($newCount -gt 0) {
-            Add-Log "[CLOUD] Downloaded $newCount new community LUA script(s)!" "#00FF00"
+        if ($newCount -gt 0 -or $updatedCount -gt 0) {
+            Add-Log "[CLOUD] $newCount nouveau(x) script(s) ajoute(s), $updatedCount script(s) mis a jour !" "#00FF00"
             Load-GameDatabase; Refresh-GameList
             return
         } else {
-            Add-Log "[CLOUD] All community LUA scripts are up to date." "#00FF00"
+            Add-Log "[CLOUD] Tous les scripts LUA locaux sont parfaitement a jour ($($remoteLuas.Count) scripts synchronises)." "#00FF00"
         }
     } catch {
         Add-Log "[!] Central server sync unavailable: $($_.Exception.Message). Trying fallbacks..." "#FF9900"
@@ -1587,10 +1659,7 @@ function Fetch-LuaFromBackup {
     }
     $existing = $global:GamesCache | Where-Object { $_.AppId -eq "$($Game.AppId)" }
     if ($existing) {
-        Add-Log "[*] Already in catalog: $($Game.Name) [$($Game.AppId)]" "#00FF00"
-        $global:AppState.Controls.GameList.SelectedItem = $existing.Display
-        Add-Log "[*] Switched to LOCAL DATABASE tab - click INJECT SELECTED." "#00FF00"
-        return
+        Add-Log "[*] Jeu deja repertorie localement: $($Game.Name) [$($Game.AppId)]. Recherche d'une version plus recente..." "#00FFFF"
     }
 
     Add-Log "[+] Searching backup repo for AppID $($Game.AppId)..." "#FF9900"
@@ -1716,6 +1785,8 @@ if (-not $xamlData) {
             <Button x:Name="InjectOnlineFixBtn" Grid.Column="1" Content="ONLINEFIX" Background="#050505" Foreground="#FF9900" Height="30" FontFamily="Consolas" Margin="4,0"/>
             <Button x:Name="SyncBtn" Grid.Column="2" Content="SYNC" Background="#050505" Foreground="#FF9900" Height="30" FontFamily="Consolas" Margin="4,0"/>
             <Button x:Name="BrowseBtn" Grid.Column="3" Content="IMPORT" Background="#050505" Foreground="#00FF00" Height="30" FontFamily="Consolas"/>
+            <Button x:Name="FixSpacewarBtn" Visibility="Collapsed"/>
+            <Button x:Name="UpdateLuaBtn" Visibility="Collapsed"/>
         </Grid>
         <ScrollViewer x:Name="LogScroll" Grid.Row="4" Margin="0,36,0,0" Height="100" VerticalScrollBarVisibility="Auto">
             <StackPanel x:Name="LogPanel"/>
@@ -1742,7 +1813,7 @@ $global:AppState.Window = [Windows.Markup.XamlReader]::Load($xmlReader)
 
 # Map all controls
 $controlNames = @(
-    "SearchBox", "GameList", "InjectBtn", "InjectOnlineFixBtn", "OnlineFixChk", "SyncBtn",
+    "SearchBox", "GameList", "InjectBtn", "InjectOnlineFixBtn", "OnlineFixChk", "SyncBtn", "FixSpacewarBtn", "UpdateLuaBtn",
     "SteamSearchBox", "SteamSearchBtn", "SteamResultList",
     "SteamGameInfo", "FetchLuaBtn", "OpenSteamDbBtn",
     "LogPanel", "LogScroll", "ClearBtn", "BrowseBtn",
@@ -1795,7 +1866,7 @@ if ($global:AppState.LogoBase64) {
 # ------------------------------------------------------------------------------
 #  10. Event Wiring
 # ------------------------------------------------------------------------------
-$buttonList = @("InjectBtn", "InjectOnlineFixBtn", "SyncBtn", "SteamSearchBtn", "FetchLuaBtn", "OpenSteamDbBtn", "BrowseBtn", "ClearBtn")
+$buttonList = @("InjectBtn", "InjectOnlineFixBtn", "SyncBtn", "SteamSearchBtn", "FetchLuaBtn", "OpenSteamDbBtn", "BrowseBtn", "ClearBtn", "FixSpacewarBtn", "UpdateLuaBtn")
 foreach ($btnName in $buttonList) {
     $btnCtrl = $global:AppState.Controls[$btnName]
     if ($btnCtrl) { $btnCtrl.Add_Click({ Invoke-ClickFlash }) }
@@ -1833,23 +1904,32 @@ if ($global:AppState.Controls.InjectOnlineFixBtn) {
         $g = $global:GamesCache | Where-Object { $_.Display -eq $sel } | Select-Object -First 1
         if ($g) {
             Add-Log "=================================================" "#00FFFF"
-            Add-Log "[*] [ONLINEFIX v2] Configuration Multijoueur pour $($g.Title) (AppID $($g.AppId))..." "#00FF41"
+            Add-Log "[*] [ONLINEFIX v3] Configuration Multijoueur pour $($g.Title) (AppID $($g.AppId))..." "#00FF41"
 
-            # 1. Injecter le script Lua dans Steam
-            Add-Log "[*] [ONLINEFIX] Etape 1/3: Injection du manifeste Lua dans Steam..." "#00FF00"
+            # 1. Injecter le script Lua du jeu
+            Add-Log "[*] [ONLINEFIX] Etape 1/4: Injection du manifeste Lua du jeu..." "#00FF00"
             Install-LuaFiles @($g.FilePath)
 
-            # 2. Configurer les options de lancement -onlinefix
-            Add-Log "[*] [ONLINEFIX] Etape 2/3: Application de l'argument Steam (-onlinefix)..." "#00FF00"
+            # 2. Injecter Spacewar (AppID 480) pour le matchmaking OnlineFix
+            $lua480 = Join-Path $global:AppState.DbPath "480.lua"
+            if (-not (Test-Path $lua480)) {
+                "-- Spacewar (OnlineFix Multiplayer Overlay)`n-- AppID 480`naddappid(480)" | Out-File $lua480 -Encoding utf8
+            }
+            Add-Log "[*] [ONLINEFIX] Etape 2/4: Injection du hook multijoueur Spacewar (480)..." "#00FF00"
+            Install-LuaFiles @($lua480)
+
+            # 3. Configurer les options de lancement -onlinefix pour le jeu ET pour Spacewar 480
+            Add-Log "[*] [ONLINEFIX] Etape 3/4: Application de l'argument Steam (-onlinefix)..." "#00FF00"
             $null = Set-SteamLaunchOptions -AppId $g.AppId -Enable:$true
+            $null = Set-SteamLaunchOptions -AppId "480" -Enable:$true
             if ($global:AppState.Controls.OnlineFixChk) {
                 $global:AppState.Controls.OnlineFixChk.IsChecked = $true
             }
 
-            # 3. Detection et lancement
+            # 4. Detection et lancement
             $steamProcess = Get-Process steam -ErrorAction SilentlyContinue
             if ($steamProcess) {
-                Add-Log "[*] [ONLINEFIX] Etape 3/3: Steam en execution detecte." "#00FF00"
+                Add-Log "[*] [ONLINEFIX] Etape 4/4: Steam en execution detecte." "#00FF00"
                 Add-Log "[*] Lancement direct avec -onlinefix via Steam..." "#00FF41"
                 try {
                     Start-Process "steam://run/$($g.AppId)//-onlinefix"
@@ -1859,15 +1939,44 @@ if ($global:AppState.Controls.InjectOnlineFixBtn) {
                 }
                 Add-Log "[i] CONSEIL MULTIJOUEUR: Si le jeu ne detecte pas les serveurs/amis, fermez completement Steam puis relancez-le." "#00FFFF"
             } else {
-                Add-Log "[*] [ONLINEFIX] Etape 3/3: Steam est ferme. LaunchOptions pre-configurees." "#00FF00"
+                Add-Log "[*] [ONLINEFIX] Etape 4/4: Steam est ferme. LaunchOptions pre-configurees." "#00FF00"
                 Add-Log "[+] Demarrez Steam pour jouer en ligne !" "#00FF41"
             }
 
-            Add-Log "[i] Compatibilite Spacewar: Pour les jeux OnlineFix utilisant AppID 480, verifiez que Spacewar est installe (steam://install/480)." "#00FFFF"
+            Add-Log "[i] Note Spacewar: Si necessaire, cliquez sur [ FIX SPACEWAR 480 ] pour activer la licence Spacewar sur votre compte." "#00FFFF"
             Add-Log "=================================================" "#00FFFF"
         } else {
             Add-Log "[!] Metadonnees du jeu introuvables." "#FF3333"
         }
+    })
+}
+
+if ($global:AppState.Controls.FixSpacewarBtn) {
+    $global:AppState.Controls.FixSpacewarBtn.Add_Click({
+        Add-Log "=================================================" "#00FFFF"
+        Add-Log "[*] [SPACEWAR 480] Configuration du hook multijoueur Spacewar..." "#00FF41"
+        $lua480 = Join-Path $global:AppState.DbPath "480.lua"
+        if (-not (Test-Path $lua480)) {
+            "-- Spacewar (OnlineFix Multiplayer Overlay)`n-- AppID 480`naddappid(480)" | Out-File $lua480 -Encoding utf8
+        }
+        Install-LuaFiles @($lua480)
+        $null = Set-SteamLaunchOptions -AppId "480" -Enable:$true
+
+        Add-Log "[*] Lancement du protocole d'enregistrement Steam pour Spacewar..." "#00FF00"
+        try {
+            Start-Process "steam://install/480"
+            Add-Log "[+] Commande steam://install/480 executee avec succes !" "#00FF00"
+        } catch {
+            try { Start-Process "steam://run/480" } catch {}
+        }
+        Add-Log "[*] Spacewar (AppID 480) est pret pour tous vos jeux OnlineFix." "#00FF41"
+        Add-Log "=================================================" "#00FFFF"
+    })
+}
+
+if ($global:AppState.Controls.UpdateLuaBtn) {
+    $global:AppState.Controls.UpdateLuaBtn.Add_Click({
+        Update-SelectedLua
     })
 }
 

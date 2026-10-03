@@ -1,8 +1,8 @@
 {
-  "version": "2.2.0",
+  "version": "2.3.0",
   "min_compatible": "2.0.0",
   "release_date": "2026-10-03",
-  "changelog": "v2.2.0: Launcher .exe natif, configuration automatique de Steam, mise a jour OTA Over-The-Air, et OnlineFix v2 avec auto-injection et support Spacewar 480.",
+  "changelog": "v2.3.0: OnlineFix v3 avance avec support Spacewar 480, mise a jour des anciens scripts LUA locaux, et synchronisation mini-supabase.",
   "files": [
     {
       "name": "Mr. Benkhriza.ps1",
@@ -15,6 +15,10 @@
     {
       "name": "server_url.txt",
       "url": "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-dllTool/main/server_url.txt"
+    },
+    {
+      "name": "version.json",
+      "url": "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-dllTool/main/version.json"
     }
   ]
 }
