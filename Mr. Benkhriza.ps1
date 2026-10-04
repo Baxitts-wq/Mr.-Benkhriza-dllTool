@@ -61,7 +61,7 @@ $global:CrashLogPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Mr_B
 #  2. State & Configuration
 # ------------------------------------------------------------------------------
 $global:AppState = [PSCustomObject]@{
-    Version          = "2.3.0"
+    Version          = "2.4.0"
     ConfigPath       = Join-Path $PSScriptRoot "mr_benkhriza_gui.json"
     XamlPath         = Join-Path $PSScriptRoot "Mr. Benkhriza.xaml"
     DbPath           = Join-Path $PSScriptRoot "database"
@@ -391,7 +391,7 @@ function Show-LicenseEntryDialog {
     $dialogXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Mr. Benkhriza Ã¢â‚¬â€ License Activation" Height="280" Width="500"
+        Title="Mr. Benkhriza ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â License Activation" Height="280" Width="500"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="#0A0A0F" Topmost="True">
     <Grid Margin="30">
@@ -1319,6 +1319,202 @@ function Import-FilesToDatabase {
 }
 
 # ------------------------------------------------------------------------------
+#  6b. Archive Package Import Engine (ZIP / RAR / 7z / Bypass / Fix Online)
+# ------------------------------------------------------------------------------
+function Expand-ArchiveAny {
+    # Returns $true on success, $false on failure
+    param([string]$ArchivePath, [string]$DestDir)
+
+    $ext = [System.IO.Path]::GetExtension($ArchivePath).ToLower()
+
+    # --- ZIP : utilise l'assembly .NET natif (pas besoin d'outils externes) ---
+    if ($ext -eq ".zip") {
+        try {
+            Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($ArchivePath, $DestDir)
+            return $true
+        } catch {
+            Add-Log "[ZIP] [ERR] Echec extraction ZIP natif: $($_.Exception.Message)" "#FF3333"
+            return $false
+        }
+    }
+
+    # --- RAR / 7z / autre : essai 7-Zip puis WinRAR ---
+    $sz7Path = $null
+    try { $sz7Cmd = Get-Command "7z" -ErrorAction SilentlyContinue; if ($sz7Cmd) { $sz7Path = $sz7Cmd.Source } } catch {}
+    $sevenZipCandidates = @(
+        "$env:ProgramFiles\7-Zip\7z.exe",
+        "${env:ProgramFiles(x86)}\7-Zip\7z.exe",
+        $sz7Path
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    if ($sevenZipCandidates.Count -gt 0) {
+        $sz = $sevenZipCandidates[0]
+        Add-Log "[ARCHIVE] Extraction via 7-Zip: $sz" "#888888"
+        try {
+            $result = & $sz x "$ArchivePath" "-o$DestDir" -y 2>&1
+            if ($LASTEXITCODE -eq 0) { return $true }
+            Add-Log "[ARCHIVE] [ERR] 7-Zip code $LASTEXITCODE" "#FF3333"
+            return $false
+        } catch {
+            Add-Log "[ARCHIVE] [ERR] 7-Zip exception: $($_.Exception.Message)" "#FF3333"
+            return $false
+        }
+    }
+
+    # --- WinRAR fallback ---
+    $winrarCandidates = @(
+        "$env:ProgramFiles\WinRAR\WinRAR.exe",
+        "${env:ProgramFiles(x86)}\WinRAR\WinRAR.exe",
+        "$env:ProgramFiles\WinRAR\Rar.exe",
+        "${env:ProgramFiles(x86)}\WinRAR\Rar.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    if ($winrarCandidates.Count -gt 0) {
+        $wr = $winrarCandidates[0]
+        Add-Log "[ARCHIVE] Extraction via WinRAR: $wr" "#888888"
+        try {
+            $result = & $wr x -y "$ArchivePath" "$DestDir\" 2>&1
+            if ($LASTEXITCODE -eq 0) { return $true }
+            Add-Log "[ARCHIVE] [ERR] WinRAR code $LASTEXITCODE" "#FF3333"
+            return $false
+        } catch {
+            Add-Log "[ARCHIVE] [ERR] WinRAR exception: $($_.Exception.Message)" "#FF3333"
+            return $false
+        }
+    }
+
+    Add-Log "[ARCHIVE] [ERR] Aucun extracteur trouve (7-Zip ou WinRAR). Installez 7-Zip pour supporter les .rar/.7z." "#FF3333"
+    Add-Log "[ARCHIVE] Telechargez 7-Zip sur: https://7-zip.org" "#FF9900"
+    return $false
+}
+
+function Import-ArchivePackage {
+    param([string]$ZipPath)
+
+    $zipName = [System.IO.Path]::GetFileNameWithoutExtension($ZipPath)
+    $isOnlineFix = ($zipName -match '(?i)(onlinefix|online.fix|bypass|fix)') -or
+                   ([System.IO.Path]::GetFileName($ZipPath) -match '(?i)(onlinefix|online.fix|bypass|fix)')
+
+    Add-Log "=================================================" "#00FFFF"
+    Add-Log "[ZIP] Analyse du paquet: $([System.IO.Path]::GetFileName($ZipPath))" "#00FFFF"
+    if ($isOnlineFix) {
+        Add-Log "[ZIP] Type detecte: BYPASS / ONLINEFIX ZIP - Installation automatique activee." "#FF9900"
+    } else {
+        Add-Log "[ZIP] Type detecte: Archive generique - Extraction des composants." "#888888"
+    }
+
+    # Chargement de l'assembly ZIP
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
+    } catch {}
+
+    $tempExtract = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "MrBenkhrizaArc_$([System.IO.Path]::GetRandomFileName())")
+    $ok = Expand-ArchiveAny -ArchivePath $ZipPath -DestDir $tempExtract
+    if (-not $ok) {
+        Add-Log "[ARCHIVE] [ERR] Impossible d'extraire l'archive." "#FF3333"
+        return
+    }
+    Add-Log "[ARCHIVE] Archive extraite vers dossier temporaire." "#00FF00"
+
+    $luaFiles     = @(Get-ChildItem -Path $tempExtract -Recurse -Filter "*.lua" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+    $dllFiles     = @(Get-ChildItem -Path $tempExtract -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+    $tomlFiles    = @(Get-ChildItem -Path $tempExtract -Recurse -Filter "*.toml" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+    $exeFiles     = @(Get-ChildItem -Path $tempExtract -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+
+    Add-Log "[ARCHIVE] Contenu trouve: $($luaFiles.Count) LUA, $($dllFiles.Count) DLL, $($tomlFiles.Count) TOML, $($exeFiles.Count) EXE (ignores)" "#00FF41"
+
+    # --- Traitement des fichiers LUA ---
+    $importedLuas = @()
+    foreach ($lua in $luaFiles) {
+        $luaName = [System.IO.Path]::GetFileName($lua)
+        $v = Verify-LuaFile $lua
+        if (-not $v.Valid) {
+            if ($v.Warn) { Add-Log "[ZIP] [SKIP] $($v.Error)" "#FF9900" }
+            else         { Add-Log "[ZIP] [BLOCK] Fichier dangereux ignore: $luaName" "#FF3333" }
+            continue
+        }
+        try {
+            $dest = Join-Path $global:AppState.DbPath $luaName
+            Copy-Item $lua $dest -Force
+            Add-Log "[ARCHIVE] [LUA] Importe dans le catalogue: $luaName" "#00FF00"
+            $importedLuas += $dest
+
+            # Upload vers le serveur central
+            try {
+                $serverUrl = if ($global:AppState -and $global:AppState.LicenseServerUrl) { $global:AppState.LicenseServerUrl } else { "http://192.168.129.130:8080" }
+                $uploadUrl = "$($serverUrl.TrimEnd('/'))/api/lua/upload"
+                $luaContent = Get-Content -LiteralPath $lua -Raw -Encoding utf8
+                $body = @{ filename = $luaName; content = $luaContent } | ConvertTo-Json
+                $null = Invoke-RestMethod -Uri $uploadUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 5 -ErrorAction SilentlyContinue
+                Add-Log "[CLOUD] Partage de $luaName avec la base centrale." "#00FF00"
+            } catch {}
+        } catch {
+            Add-Log "[ARCHIVE] [ERR] Echec import LUA: $luaName - $($_.Exception.Message)" "#FF3333"
+        }
+    }
+
+    # --- Traitement des fichiers DLL / TOML (SteamFiles) ---
+    $steamFilesDir = Join-Path $PSScriptRoot "SteamFiles"
+    if (-not (Test-Path $steamFilesDir)) { try { New-Item -ItemType Directory -Path $steamFilesDir -Force | Out-Null } catch {} }
+
+    $sfCopied = 0
+    foreach ($sf in ($dllFiles + $tomlFiles)) {
+        $sfName = [System.IO.Path]::GetFileName($sf)
+        # Securite: ne jamais copier un DLL suspect de plus de 20MB
+        $sfInfo = Get-Item $sf -ErrorAction SilentlyContinue
+        if ($sfInfo -and $sfInfo.Length -gt 20MB) {
+            Add-Log "[ARCHIVE] [SKIP] DLL trop volumineux (>20MB): $sfName" "#FF9900"
+            continue
+        }
+        try {
+            $dest = Join-Path $steamFilesDir $sfName
+            Copy-Item $sf $dest -Force
+            Add-Log "[ARCHIVE] [SF] Copie dans SteamFiles: $sfName" "#00FF00"
+            $sfCopied++
+        } catch {
+            Add-Log "[ARCHIVE] [ERR] Echec copie SteamFiles: $sfName" "#FF3333"
+        }
+    }
+
+    # Deployer les SteamFiles dans Steam si necessaire
+    if ($sfCopied -gt 0 -and $global:AppState.SteamRoot) {
+        try { Initialize-SteamEnvironment } catch {}
+        Add-Log "[ARCHIVE] SteamFiles deployes dans $($global:AppState.SteamRoot)." "#00FF41"
+    }
+
+    # --- Mise a jour de la base locale ---
+    if ($importedLuas.Count -gt 0) {
+        Load-GameDatabase
+        Refresh-GameList
+        $last = Get-GameMetadata $importedLuas[-1]
+        $global:AppState.Controls.GameList.SelectedItem = $last.Display
+    }
+
+    # --- Auto-injection si bypass/onlinefix detecte ---
+    if ($isOnlineFix -and $importedLuas.Count -gt 0) {
+        Add-Log "[ARCHIVE] [AUTO] Mode bypass detecte - injection automatique des LUA..." "#FF9900"
+        Install-LuaFiles $importedLuas
+
+        # Injecter aussi 480.lua pour le support OnlineFix
+        $lua480 = Join-Path $global:AppState.DbPath "480.lua"
+        if (-not (Test-Path $lua480)) {
+            "-- Spacewar (OnlineFix Multiplayer Overlay)`n-- AppID 480`naddappid(480)" | Out-File $lua480 -Encoding utf8
+        }
+        Install-LuaFiles @($lua480)
+        Add-Log "[ARCHIVE] [AUTO] Injection Spacewar 480 efectuee pour le support multijoueur." "#00FF41"
+    } elseif ($importedLuas.Count -gt 0) {
+        Add-Log "[ARCHIVE] Catalogue mis a jour. Selectionnez un jeu et cliquez [ INJECT LUA ] pour injecter." "#00FF41"
+    }
+
+    # Nettoyage du dossier temporaire
+    try { Remove-Item -Path $tempExtract -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+
+    Add-Log "[ARCHIVE] Traitement termine: $($importedLuas.Count) LUA(s), $sfCopied composant(s) Steam." "#00FFFF"
+    Add-Log "=================================================" "#00FFFF"
+}
+
+# ------------------------------------------------------------------------------
 #  7. Community Central Sync & GitHub Backup Engine
 # ------------------------------------------------------------------------------
 function Update-SelectedLua {
@@ -1529,7 +1725,7 @@ function Show-WebView2FallbackDialog {
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Text="FETCH LUA Ã¢â‚¬â€ BROWSER REQUIRED" FontFamily="Consolas" FontSize="14"
+        <TextBlock Grid.Row="0" Text="FETCH LUA ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â BROWSER REQUIRED" FontFamily="Consolas" FontSize="14"
                    Foreground="#FF9900" FontWeight="Bold" Margin="0,0,0,12"/>
         <TextBlock Grid.Row="1" FontFamily="Consolas" FontSize="11" Foreground="#CCCCCC"
                    TextWrapping="Wrap" Margin="0,0,0,10"
@@ -2060,30 +2256,50 @@ $global:AppState.Window.Add_DragEnter({
     param($s, $e)
     if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
         $e.Effects = [System.Windows.DragDropEffects]::Copy
+        $e.Handled = $true
+    }
+})
+$global:AppState.Window.Add_DragOver({
+    param($s, $e)
+    if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
+        $e.Effects = [System.Windows.DragDropEffects]::Copy
+        $e.Handled = $true
     }
 })
 $global:AppState.Window.Add_Drop({
     param($s, $e)
     if ($e.Data.GetDataPresent([System.Windows.DataFormats]::FileDrop)) {
         $files = $e.Data.GetData([System.Windows.DataFormats]::FileDrop)
-        $luaFiles = @(); $pluginFiles = @()
+        $luaFiles = @(); $zipFiles = @(); $dllFiles = @()
         foreach ($f in $files) {
             $ext = [System.IO.Path]::GetExtension($f).ToLower()
-            if ($ext -eq ".dll" -or $ext -eq ".zip") { $pluginFiles += $f }
-            elseif ($ext -eq ".lua") { $luaFiles += $f }
-            else { Add-Log "[!] Unsupported file type dropped: $([System.IO.Path]::GetFileName($f))" "#FF9900" }
+            switch ($ext) {
+                ".lua"  { $luaFiles += $f }
+                ".zip"  { $zipFiles += $f }
+                ".rar"  { $zipFiles += $f }
+                ".7z"   { $zipFiles += $f }
+                ".dll"  { $dllFiles += $f }
+                default {
+                    Add-Log "[!] Type non supporte: $([System.IO.Path]::GetFileName($f)) (ZIP/RAR/7z/LUA/DLL attendu)" "#FF9900"
+                }
+            }
         }
+        # Traitement des LUA directement deposes
         if ($luaFiles.Count -gt 0) { Import-FilesToDatabase $luaFiles }
-        if ($pluginFiles.Count -gt 0) {
+        # Traitement des archives (ZIP / RAR / 7z)
+        foreach ($zf in $zipFiles) { Import-ArchivePackage -ZipPath $zf }
+        # Traitement des DLL isoles (copie dans SteamFiles + deploiement)
+        if ($dllFiles.Count -gt 0) {
             $destDir = Join-Path $PSScriptRoot "SteamFiles"
             if (-not (Test-Path $destDir)) { try { New-Item -ItemType Directory -Path $destDir -Force | Out-Null } catch {} }
-            foreach ($pf in $pluginFiles) {
+            foreach ($pf in $dllFiles) {
                 $name = [System.IO.Path]::GetFileName($pf)
                 try {
                     Copy-Item $pf (Join-Path $destDir $name) -Force
-                    Add-Log "[*] [OK] Copied plugin to SteamFiles: $name" "#00FF00"
-                } catch { Add-Log "[!] [ERR] Failed to copy plugin: $name - $($_.Exception.Message)" "#FF3333" }
+                    Add-Log "[*] [OK] DLL copie dans SteamFiles: $name" "#00FF00"
+                } catch { Add-Log "[!] [ERR] Echec copie DLL: $name - $($_.Exception.Message)" "#FF3333" }
             }
+            try { Initialize-SteamEnvironment } catch {}
         }
     }
 })
