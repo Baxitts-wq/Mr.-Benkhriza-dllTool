@@ -109,7 +109,7 @@ if (Test-Path $global:AppState.ConfigPath) {
         $global:AppState.GithubToken   = if ($loaded.GithubToken)   { $loaded.GithubToken }   else { "" }
         $global:AppState.LocalRepoPath = if ($loaded.LocalRepoPath) { $loaded.LocalRepoPath } else { "" }
         $global:AppState.AdminPassword    = if ($loaded.AdminPassword) { $loaded.AdminPassword } else { "BENKHRIZA-ADMIN-2026" }
-        $global:AppState.LicenseServerUrl = if ($loaded.LicenseServerUrl) { $loaded.LicenseServerUrl } else { "https://walker-implied-spears-church.trycloudflare.com" }
+        $global:AppState.LicenseServerUrl = if ($loaded.LicenseServerUrl) { $loaded.LicenseServerUrl } else { "https://appreciation-dec-known-vessel.trycloudflare.com" }
     } catch {
         $global:AppState.Theme         = $defaultConfig.Theme
         $global:AppState.BackupUrl     = $defaultConfig.BackupUrl
@@ -128,37 +128,144 @@ if (Test-Path $global:AppState.ConfigPath) {
     $global:AppState.LicenseServerUrl = $defaultConfig.LicenseServerUrl
 }
 
-# --- DPAPI license key storage (machine-bound, tamper-resistant) ---
+# --- DPAPI license key storage & cryptographic lease (machine-bound, tamper-resistant) ---
 function Get-AuthFilePath {
     $dir = [System.IO.Path]::Combine($env:APPDATA, "MrBenkhriza")
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     return [System.IO.Path]::Combine($dir, ".auth.dat")
 }
 
-function Save-LicenseKey {
-    param([string]$Key)
+function Get-LicenseHMAC {
+    param([string]$Key, [string]$HWID)
+    $salt = "MB-BENKHRIZA-SECURITY-OFFLINE-SALT-v3.0#2026!SECRET"
+    $raw = "$($Key.Trim().ToUpper())|$($HWID.Trim().ToUpper())|$salt"
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($raw)
+    $hash = $sha.ComputeHash($bytes)
+    return ([BitConverter]::ToString($hash) -replace '-').Substring(0, 32)
+}
+
+function Save-LicenseAuthRecord {
+    param(
+        [string]$Key,
+        [bool]$OnlineVerified = $false
+    )
+    if ([string]::IsNullOrWhiteSpace($Key)) { return $false }
     try {
-        $bytes     = [System.Text.Encoding]::UTF8.GetBytes($Key.Trim())
+        $myHWID = Get-SystemHWID
+        $sig = Get-LicenseHMAC -Key $Key -HWID $myHWID
+        $record = [ordered]@{
+            Key                 = $Key.Trim()
+            HWID                = $myHWID
+            MachineName         = $env:COMPUTERNAME
+            Signature           = $sig
+            FirstActivated      = (Get-Date).ToString("o")
+            LastVerified        = (Get-Date).ToString("o")
+            OnlineVerified      = $OnlineVerified
+            Version             = "3.0"
+        }
+        $json = $record | ConvertTo-Json -Compress
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+        $entropy = [System.Text.Encoding]::UTF8.GetBytes("MrBenkhrizaSecurityEntropy2026")
         $encrypted = [System.Security.Cryptography.ProtectedData]::Protect(
-            $bytes, $null,
+            $bytes, $entropy,
             [System.Security.Cryptography.DataProtectionScope]::CurrentUser
         )
         [System.IO.File]::WriteAllBytes((Get-AuthFilePath), $encrypted)
         return $true
-    } catch { return $false }
+    } catch {
+        return $false
+    }
 }
 
-function Load-LicenseKey {
+function Load-LicenseAuthRecord {
     $path = Get-AuthFilePath
     if (-not (Test-Path $path)) { return $null }
     try {
         $encrypted = [System.IO.File]::ReadAllBytes($path)
-        $decrypted = [System.Security.Cryptography.ProtectedData]::Unprotect(
-            $encrypted, $null,
-            [System.Security.Cryptography.DataProtectionScope]::CurrentUser
-        )
-        return [System.Text.Encoding]::UTF8.GetString($decrypted)
-    } catch { return $null }
+        $entropy = [System.Text.Encoding]::UTF8.GetBytes("MrBenkhrizaSecurityEntropy2026")
+        $decrypted = $null
+        try {
+            $decrypted = [System.Security.Cryptography.ProtectedData]::Unprotect(
+                $encrypted, $entropy,
+                [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+            )
+        } catch {
+            # Backward compatibility with legacy plain .auth.dat without entropy
+            try {
+                $decrypted = [System.Security.Cryptography.ProtectedData]::Unprotect(
+                    $encrypted, $null,
+                    [System.Security.Cryptography.DataProtectionScope]::CurrentUser
+                )
+            } catch { return $null }
+        }
+        if (-not $decrypted) { return $null }
+        $text = [System.Text.Encoding]::UTF8.GetString($decrypted).Trim()
+
+        if ($text.StartsWith("{") -and $text.EndsWith("}")) {
+            $obj = $text | ConvertFrom-Json
+            $myHWID = Get-SystemHWID
+            $expectedSig = Get-LicenseHMAC -Key $obj.Key -HWID $obj.HWID
+            if ($obj.HWID -eq $myHWID -and $obj.Signature -eq $expectedSig) {
+                return $obj
+            } else {
+                return [PSCustomObject]@{
+                    Tampered    = $true
+                    BoundHWID   = $obj.HWID
+                    CurrentHWID = $myHWID
+                    Key         = $obj.Key
+                }
+            }
+        } else {
+            # Legacy plain key string - auto-upgrade to modern signed record
+            $legacyKey = $text.Trim()
+            if ($legacyKey.Length -ge 8) {
+                Save-LicenseAuthRecord -Key $legacyKey -OnlineVerified $false | Out-Null
+                return (Load-LicenseAuthRecord)
+            }
+        }
+    } catch {
+        return $null
+    }
+    return $null
+}
+
+function Save-LicenseKey {
+    param([string]$Key)
+    return (Save-LicenseAuthRecord -Key $Key -OnlineVerified $false)
+}
+
+function Load-LicenseKey {
+    # 1. First, check valid machine-bound DPAPI lease
+    $record = Load-LicenseAuthRecord
+    if ($record -and -not $record.Tampered -and $record.Key) {
+        return $record.Key
+    }
+
+    # 2. Local license.key file next to script
+    if ($global:AppState -and $global:AppState.ScriptDir) {
+        $keyFile = Join-Path $global:AppState.ScriptDir "license.key"
+        if (Test-Path $keyFile) {
+            try {
+                $raw = (Get-Content -Path $keyFile -Raw -Encoding utf8).Trim()
+                if ($raw -and -not $raw.StartsWith("#") -and $raw.Length -ge 8) {
+                    return $raw
+                }
+            } catch {}
+        }
+    }
+
+    # 3. Local mr_benkhriza_gui.json if LicenseKey is filled
+    if ($global:AppState -and $global:AppState.ConfigPath -and (Test-Path $global:AppState.ConfigPath)) {
+        try {
+            $j = Get-Content $global:AppState.ConfigPath -Raw | ConvertFrom-Json
+            if ($j.LicenseKey -and -not [string]::IsNullOrWhiteSpace($j.LicenseKey) -and $j.LicenseKey.Trim().Length -ge 8) {
+                return $j.LicenseKey.Trim()
+            }
+        } catch {}
+    }
+
+    return $null
 }
 
 if (-not $global:AppState.SteamRoot) {
@@ -307,15 +414,11 @@ function Get-LicenseServerCandidates {
     # 2. Realtime dynamic discovery from Ntfy (updated live by PC2 tunnel daemon, sub-300ms)
     try {
         $resp = Invoke-RestMethod -Uri 'https://ntfy.sh/bexytv-internal-url-998877/json?poll=1' -TimeoutSec 3
-        if ($resp -is [array]) {
-            for ($i = $resp.Count - 1; $i -ge 0; $i--) {
-                if ($resp[$i].message -match 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com') {
-                    $candidates.Add($matches[0])
-                    break
-                }
-            }
-        } elseif ($resp.message -match 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com') {
-            $candidates.Add($matches[0])
+        $respText = [string]$resp
+        $allMatches = [regex]::Matches($respText, 'https://[a-zA-Z0-9\-]+\.trycloudflare\.com')
+        if ($allMatches.Count -gt 0) {
+            $latestUrl = $allMatches[$allMatches.Count - 1].Value
+            $candidates.Add($latestUrl)
         }
     } catch {}
 
@@ -328,7 +431,7 @@ function Get-LicenseServerCandidates {
     } catch {}
 
     # 4. Known active Cloudflare tunnel
-    $candidates.Add("https://walker-implied-spears-church.trycloudflare.com")
+    $candidates.Add("https://appreciation-dec-known-vessel.trycloudflare.com")
 
     # 5. Local LAN IP as final fallback (for local Wi-Fi dev)
     if ($cfgUrl -and $cfgUrl -notmatch '^https://') {
@@ -340,7 +443,10 @@ function Get-LicenseServerCandidates {
 }
 
 function Test-SupabaseLicense {
-    param([string]$LicenseKey)
+    param(
+        [string]$LicenseKey,
+        [switch]$AllowOfflineFallback
+    )
 
     if ([string]::IsNullOrWhiteSpace($LicenseKey)) {
         return [PSCustomObject]@{ Success = $false; Mode = "MissingKey"; Message = "No license key provided."; HWID = (Get-SystemHWID) }
@@ -355,11 +461,14 @@ function Test-SupabaseLicense {
     $candidates = Get-LicenseServerCandidates
     $lastError = "No connection possible to authentication server."
 
+    # When offline fallback is allowed (already bound locally), use strict short timeout (2s)
+    $timeoutSec = if ($AllowOfflineFallback) { 2 } else { 3 }
+
     foreach ($serverUrl in $candidates) {
         if ([string]::IsNullOrWhiteSpace($serverUrl)) { continue }
         $apiUrl = "$($serverUrl.TrimEnd('/'))/api/license/verify"
         try {
-            $response = Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec 4
+            $response = Invoke-RestMethod -Uri $apiUrl -Method Post -Body $body -ContentType "application/json" -TimeoutSec $timeoutSec
             if ($response) {
                 # Success reaching server - cache this working server URL in AppState
                 if ($global:AppState) { $global:AppState.LicenseServerUrl = $serverUrl }
@@ -378,6 +487,16 @@ function Test-SupabaseLicense {
         }
     }
 
+    # If server unreachable and offline fallback is allowed:
+    if ($AllowOfflineFallback) {
+        return [PSCustomObject]@{
+            Success   = $true
+            Mode      = "OfflineVerified"
+            Message   = "Serveur hors ligne. Matériel HWID vérifié localement (Mode Hors Ligne)."
+            HWID      = $myHWID
+        }
+    }
+
     return [PSCustomObject]@{
         Success = $false
         Mode    = "ServerError"
@@ -391,7 +510,7 @@ function Show-LicenseEntryDialog {
     $dialogXaml = @"
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Mr. Benkhriza ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â License Activation" Height="280" Width="500"
+        Title="Mr. Benkhriza Ã¢â‚¬â€ License Activation" Height="280" Width="500"
         WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
         Background="#0A0A0F" Topmost="True">
     <Grid Margin="30">
@@ -446,11 +565,30 @@ Your key will be encrypted and bound to this PC's hardware ID."
 
             $authResult = Test-SupabaseLicense -LicenseKey $k
             if ($authResult.Success) {
-                Save-LicenseKey -Key $k | Out-Null
+                Save-LicenseAuthRecord -Key $k -OnlineVerified $true | Out-Null
                 $result.Key = $k
                 $result.Activated = $true
                 $dlg.DialogResult = $true
                 $dlg.Close()
+            } elseif ($authResult.Mode -eq "ServerError") {
+                # Server is offline / unreachable during activation
+                # Check if this key matches genuine product key format
+                if ($k -match '^MB-KEY-[A-Z0-9\-]{8,}$') {
+                    Save-LicenseAuthRecord -Key $k -OnlineVerified $false | Out-Null
+                    $result.Key = $k
+                    $result.Activated = $true
+                    [System.Windows.MessageBox]::Show(
+                        "Serveur d'authentification temporairement hors ligne.`n`nActivation hors ligne réussie ! La licence a été liée à cet ordinateur (HWID crypté).`nSynchronisation automatique lors de la prochaine connexion.",
+                        "Mr. Benkhriza - Mode Hors Ligne",
+                        [System.Windows.MessageBoxButton]::OK,
+                        [System.Windows.MessageBoxImage]::Information
+                    ) | Out-Null
+                    $dlg.DialogResult = $true
+                    $dlg.Close()
+                } else {
+                    $statusTb.Foreground = [System.Windows.Media.Brushes]::Red
+                    $statusTb.Text = "Serveur hors ligne & format de clé invalide. Format requis: MB-KEY-XXXX-XXXX."
+                }
             } else {
                 $statusTb.Foreground = [System.Windows.Media.Brushes]::Red
                 $statusTb.Text = $authResult.Message
@@ -1725,7 +1863,7 @@ function Show-WebView2FallbackDialog {
             <RowDefinition Height="*"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Text="FETCH LUA ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â BROWSER REQUIRED" FontFamily="Consolas" FontSize="14"
+        <TextBlock Grid.Row="0" Text="FETCH LUA Ã¢â‚¬â€ BROWSER REQUIRED" FontFamily="Consolas" FontSize="14"
                    Foreground="#FF9900" FontWeight="Bold" Margin="0,0,0,12"/>
         <TextBlock Grid.Row="1" FontFamily="Consolas" FontSize="11" Foreground="#CCCCCC"
                    TextWrapping="Wrap" Margin="0,0,0,10"
@@ -2315,6 +2453,19 @@ Refresh-AudioTrackList
 #  11b. License Gate (runs before the main window opens)
 # ------------------------------------------------------------------------------
 if (-not $global:TestOnly) {
+    $existingRecord = Load-LicenseAuthRecord
+
+    # Check for hardware mismatch (tampering / cloned install)
+    if ($existingRecord -and $existingRecord.Tampered) {
+        [System.Windows.MessageBox]::Show(
+            "ACCESS DENIED`n`nViolation de sécurité matérielle détectée (HWID différent ou copie non autorisée).`n`nCette licence est strictement liée à sa machine d'origine.",
+            "Mr. Benkhriza - Protection Sécurité",
+            [System.Windows.MessageBoxButton]::OK,
+            [System.Windows.MessageBoxImage]::Stop
+        ) | Out-Null
+        [System.Environment]::Exit(0)
+    }
+
     $storedKey = Load-LicenseKey
 
     # No key cached - show standalone activation dialog
@@ -2324,11 +2475,25 @@ if (-not $global:TestOnly) {
             [System.Environment]::Exit(0)
         }
         $storedKey = $activationResult.Key
+        $existingRecord = Load-LicenseAuthRecord
     }
 
-    # Validate key against Supabase
-    $authResult = Test-SupabaseLicense -LicenseKey $storedKey
-    if (-not $authResult.Success) {
+    # Determine if we already have a valid local lease
+    $hasValidLocalLease = ($existingRecord -and -not $existingRecord.Tampered -and $existingRecord.Key -eq $storedKey)
+
+    # Validate key against Server (with seamless offline fallback if locally bound)
+    $authResult = Test-SupabaseLicense -LicenseKey $storedKey -AllowOfflineFallback:$hasValidLocalLease
+
+    if ($authResult.Success) {
+        if ($authResult.Mode -eq "OfflineVerified") {
+            $global:AppState.LicenseMode = "OfflineVerified"
+            Save-LicenseAuthRecord -Key $storedKey -OnlineVerified $false | Out-Null
+        } else {
+            $global:AppState.LicenseMode = "OnlineVerified"
+            Save-LicenseAuthRecord -Key $storedKey -OnlineVerified $true | Out-Null
+        }
+    } else {
+        # Server explicitly rejected key (HWIDMismatch on server, SuspendedKey, InvalidKey)
         if ($authResult.Mode -eq "HWIDMismatch" -or $authResult.Mode -eq "SuspendedKey" -or $authResult.Mode -eq "InvalidKey") {
             try { Remove-Item (Get-AuthFilePath) -Force -ErrorAction SilentlyContinue } catch {}
         }
@@ -2340,6 +2505,7 @@ if (-not $global:TestOnly) {
         ) | Out-Null
         [System.Environment]::Exit(0)
     }
+
     $global:AppState.HWID = Get-SystemHWID
 }
 
@@ -2348,8 +2514,11 @@ if ($global:AppState.Window) {
         $hwid = Get-SystemHWID
         $global:AppState.HWID = $hwid
 
-        Add-Log "[SECURITY] [OK] License verified. [HWID: $($hwid.Substring(0,8))...]" "#00FF41"
-
+        if ($global:AppState.LicenseMode -eq "OfflineVerified") {
+            Add-Log "[SECURITY] [OFFLINE] Machine validée en local [HWID: $($hwid.Substring(0,8))...] Mode Hors Ligne actif." "#00FF41"
+        } else {
+            Add-Log "[SECURITY] [ONLINE] Serveur connecté. Licence vérifiée [HWID: $($hwid.Substring(0,8))...]" "#00FF41"
+        }
         Start-SystemAudio
         Start-MatrixRain
         Start-MainMatrixRain
@@ -2407,6 +2576,22 @@ if ($global:AppState.Window) {
                                             Add-Log "[BOOT] Catalog loaded - $($global:GamesCache.Count) game(s) in database." "#00FF00"
                                             Add-Log "[BOOT] System ready." "#00FF00"
                                             try { Check-OtaUpdate -Silent } catch {}
+
+                                            # Synchronisation silencieuse en tâche de fond si démarré hors ligne
+                                            if ($global:AppState.LicenseMode -eq "OfflineVerified") {
+                                                [System.Threading.ThreadPool]::QueueUserWorkItem({
+                                                    Start-Sleep -Seconds 6
+                                                    try {
+                                                        $rec = Load-LicenseAuthRecord
+                                                        if ($rec -and $rec.Key) {
+                                                            $check = Test-SupabaseLicense -LicenseKey $rec.Key
+                                                            if ($check.Success -and $check.Mode -ne "OfflineVerified") {
+                                                                Save-LicenseAuthRecord -Key $rec.Key -OnlineVerified $true | Out-Null
+                                                            }
+                                                        }
+                                                    } catch {}
+                                                }) | Out-Null
+                                            }
                                         }
                                     }
                                 }
