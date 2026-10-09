@@ -85,10 +85,10 @@ $defaultConfig = @{
     Version          = $global:AppState.Version
     SteamPath        = ""
     LogFile          = ""
-    BackupUrl        = "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-Lua-dllTool/main/gui/database/"
+    BackupUrl        = "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-dllTool/main/database/"
     GithubToken      = ""
     LocalRepoPath    = ""
-    AdminPassword    = "Imad.993514"
+    AdminPassword    = "BENKHRIZA-ADMIN-2026"
     LicenseServerUrl = "http://192.168.129.130:8080"
     Theme = @{
         AccentGreen  = "#00FF41"
@@ -1185,8 +1185,7 @@ function Check-OtaUpdate {
         [switch]$Silent
     )
     $otaCandidates = @(
-        "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-dllTool/main/version.json",
-        "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-Lua-dllTool/main/version.json"
+        "https://raw.githubusercontent.com/Baxitts-wq/Mr.-Benkhriza-dllTool/main/version.json"
     )
     if ($global:AppState -and $global:AppState.LicenseServerUrl) {
         $otaCandidates = @("$($global:AppState.LicenseServerUrl.TrimEnd('/'))/api/version.json") + $otaCandidates
